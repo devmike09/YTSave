@@ -3,8 +3,10 @@ import logging
 import threading
 import asyncio
 import time
+import sys
 from flask import Flask
 from telegram import Update
+from telegram.error import Conflict
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 import yt_dlp
 
@@ -29,17 +31,16 @@ def health_check():
 
 def run_flask():
     try:
-        app.run(host='0.0.0.0', port=PORT, use_reloader=False)
+        # Use a simpler server for production stability
+        app.run(host='0.0.0.0', port=PORT, use_reloader=False, threaded=True)
     except Exception as e:
         logger.error(f"Flask server error: {e}")
 
 # --- YOUTUBE DOWNLOAD LOGIC ---
 async def download_video(url: str, chat_id: int, status_msg):
-    # Using a unique filename per request to avoid collision
     filename = f"video_{chat_id}_{int(time.time())}.mp4"
     
     ydl_opts = {
-        # 'best' is more reliable than 'best[ext=mp4]' for restricted videos
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': filename,
         'quiet': True,
@@ -55,15 +56,12 @@ async def download_video(url: str, chat_id: int, status_msg):
     try:
         def run_ydl():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                # Use download=True directly
                 ydl.download([url])
                 return ydl.extract_info(url, download=False)
 
         loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(None, run_ydl)
+        await loop.run_in_executor(None, run_ydl)
         
-        # Check for the filename (yt-dlp might have appended .mp4 or similar)
-        # We look for the file that starts with our base filename
         actual_file = None
         for f in os.listdir('.'):
             if f.startswith(f"video_{chat_id}"):
@@ -79,7 +77,6 @@ async def download_video(url: str, chat_id: int, status_msg):
         
         return actual_file, None
     except Exception as e:
-        # Cleanup any partial files
         for f in os.listdir('.'):
             if f.startswith(f"video_{chat_id}"):
                 os.remove(f)
@@ -87,7 +84,14 @@ async def download_video(url: str, chat_id: int, status_msg):
 
 # --- BOT HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Send me a YouTube link and I will download it for you!")
+    await update.message.reply_text("👋 Send me a YouTube link!")
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if isinstance(context.error, Conflict):
+        logger.warning("Conflict detected. Waiting for other instance to exit...")
+        time.sleep(5)
+    else:
+        logger.error(f"Exception while handling an update: {context.error}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text
@@ -106,52 +110,55 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.edit_text(f"❌ Error: {error}")
             return
 
-        await status_msg.edit_text("⬆️ Uploading video to Telegram...")
+        await status_msg.edit_text("⬆️ Uploading...")
         
         with open(video_path, 'rb') as video_file:
-            await context.bot.send_video(
-                chat_id=chat_id, 
-                video=video_file,
-                supports_streaming=True
-            )
+            await context.bot.send_video(chat_id=chat_id, video=video_file, supports_streaming=True)
         
         await status_msg.delete()
         os.remove(video_path)
 
     except Exception as e:
         logger.error(f"Error: {e}")
-        await status_msg.edit_text("❌ An error occurred during processing.")
+        await status_msg.edit_text("❌ Download error.")
         if 'video_path' in locals() and os.path.exists(video_path):
             os.remove(video_path)
 
 # --- MAIN EXECUTION ---
-if __name__ == '__main__':
+async def main():
     if not TOKEN:
         logger.error("TELEGRAM_TOKEN is missing!")
-        exit(1)
+        sys.exit(1)
 
-    # 1. Start Flask (Keep-Alive) in background
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
+    # 1. Start Flask in background thread
+    threading.Thread(target=run_flask, daemon=True).start()
 
-    # 2. Startup Delay to let Render clear old instances
-    time.sleep(10)
-
-    # 3. Build Application
+    # 2. Setup Application
     application = ApplicationBuilder().token(TOKEN).build()
-    
-    # 4. Explicitly kick off other instances by deleting webhook
-    async def clear_proxy():
-        await application.bot.delete_webhook(drop_pending_updates=True)
-        print("Webhook cleared, starting polling...")
-
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(clear_proxy())
-
-    # 5. Setup Handlers
     application.add_handler(CommandHandler('start', start))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    
-    # 6. Run Polling
-    application.run_polling(drop_pending_updates=True)
+    application.add_error_handler(error_handler)
+
+    # 3. Aggressive Webhook Cleanup
+    logger.info("Resetting Telegram connection...")
+    await application.bot.delete_webhook(drop_pending_updates=True)
+    await asyncio.sleep(2) # Brief pause
+
+    # 4. Start Polling
+    logger.info("Bot starting...")
+    async with application:
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling(drop_pending_updates=True)
+        
+        # Keep the loop running
+        while True:
+            await asyncio.sleep(3600)
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        logger.fatal(f"Fatal error: {e}")
