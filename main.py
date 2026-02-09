@@ -35,14 +35,17 @@ def run_flask():
 
 # --- YOUTUBE DOWNLOAD LOGIC ---
 async def download_video(url: str, chat_id: int, status_msg):
-    filename = f"video_{chat_id}.mp4"
+    # Using a unique filename per request to avoid collision
+    filename = f"video_{chat_id}_{int(time.time())}.mp4"
     
     ydl_opts = {
-        'format': 'best[ext=mp4]/best', 
+        # 'best' is more reliable than 'best[ext=mp4]' for restricted videos
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': filename,
         'quiet': True,
         'noplaylist': True,
         'max_filesize': 50 * 1024 * 1024,
+        'merge_output_format': 'mp4',
     }
 
     if os.path.exists(COOKIES_FILE):
@@ -50,26 +53,36 @@ async def download_video(url: str, chat_id: int, status_msg):
         logger.info("Using cookies.txt for authentication")
 
     try:
-        # Using a thread pool for the blocking yt_dlp call
         def run_ydl():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                return info
+                # Use download=True directly
+                ydl.download([url])
+                return ydl.extract_info(url, download=False)
 
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(None, run_ydl)
         
-        if not os.path.exists(filename):
+        # Check for the filename (yt-dlp might have appended .mp4 or similar)
+        # We look for the file that starts with our base filename
+        actual_file = None
+        for f in os.listdir('.'):
+            if f.startswith(f"video_{chat_id}"):
+                actual_file = f
+                break
+
+        if not actual_file or not os.path.exists(actual_file):
              return None, "Download failed (File not found)."
              
-        if os.path.getsize(filename) > 49 * 1024 * 1024:
-            os.remove(filename)
+        if os.path.getsize(actual_file) > 49 * 1024 * 1024:
+            os.remove(actual_file)
             return None, "File too large for Telegram (Max 50MB)."
         
-        return filename, None
+        return actual_file, None
     except Exception as e:
-        if os.path.exists(filename):
-            os.remove(filename)
+        # Cleanup any partial files
+        for f in os.listdir('.'):
+            if f.startswith(f"video_{chat_id}"):
+                os.remove(f)
         return None, str(e)
 
 # --- BOT HANDLERS ---
@@ -122,16 +135,23 @@ if __name__ == '__main__':
     flask_thread.daemon = True
     flask_thread.start()
 
-    # 2. Add a small sleep to allow Render to potentially shut down old instances
-    # and to allow the Flask port to bind properly.
-    time.sleep(5)
+    # 2. Startup Delay to let Render clear old instances
+    time.sleep(10)
 
-    # 3. Build and Start Bot with Conflict handling
+    # 3. Build Application
     application = ApplicationBuilder().token(TOKEN).build()
+    
+    # 4. Explicitly kick off other instances by deleting webhook
+    async def clear_proxy():
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        print("Webhook cleared, starting polling...")
+
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(clear_proxy())
+
+    # 5. Setup Handlers
     application.add_handler(CommandHandler('start', start))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     
-    print("Bot is starting up...")
-    
-    # drop_pending_updates=True clears old messages that arrived while bot was offline
+    # 6. Run Polling
     application.run_polling(drop_pending_updates=True)
